@@ -4617,6 +4617,343 @@ class PHPMultiCurlClassTest extends \PHPUnit\Framework\TestCase
         }
     }
 
+    public function testRetryRateLimitAttemptConsumesQuota()
+    {
+        // Assert that each attempt including retries consumes rate limit
+        // quota and that beforeSend and afterSend callbacks are called for
+        // each attempt while success, error, and complete callbacks are
+        // called only once after the final attempt.
+        $multi_curl = new MultiCurl();
+        $multi_curl->setOpt(CURLOPT_COOKIEJAR, '/dev/null');
+        $multi_curl->setHeader('X-DEBUG-TEST', 'retry');
+        $multi_curl->setRateLimit('10/1m');
+        $multi_curl->setRetry(3);
+
+        $before_send_call_count = 0;
+        $after_send_call_count = 0;
+        $success_call_count = 0;
+        $error_call_count = 0;
+        $complete_call_count = 0;
+
+        $instance = $multi_curl->addGet(Test::TEST_URL, ['failures' => '2']);
+        $instance->beforeSend(function ($instance) use (&$before_send_call_count) {
+            $before_send_call_count += 1;
+        });
+        $instance->afterSend(function ($instance) use (&$after_send_call_count) {
+            $after_send_call_count += 1;
+        });
+        $instance->success(function ($instance) use (&$success_call_count) {
+            $success_call_count += 1;
+        });
+        $instance->error(function ($instance) use (&$error_call_count) {
+            $error_call_count += 1;
+        });
+        $instance->complete(function ($instance) use (&$complete_call_count) {
+            $complete_call_count += 1;
+        });
+
+        $multi_curl->start();
+
+        $this->assertFalse($instance->error);
+        $this->assertEquals(3, $instance->attempts);
+        $this->assertEquals(2, $instance->retries);
+
+        // Assert each of the 3 attempts consumed rate limit quota.
+        $this->assertEquals(3, \Helper\get_multi_curl_property_value($multi_curl, 'currentRequestCount'));
+
+        // Assert beforeSend and afterSend callbacks were called for each attempt.
+        $this->assertEquals(3, $before_send_call_count);
+        $this->assertEquals(3, $after_send_call_count);
+
+        // Assert success, error, and complete callbacks were called only once.
+        $this->assertEquals(1, $success_call_count);
+        $this->assertEquals(0, $error_call_count);
+        $this->assertEquals(1, $complete_call_count);
+    }
+
+    public function testRetryRateLimitAttemptConsumesQuotaError()
+    {
+        // Assert callback counts for a request that fails all attempts while
+        // rate limiting is enabled.
+        $multi_curl = new MultiCurl();
+        $multi_curl->setOpt(CURLOPT_COOKIEJAR, '/dev/null');
+        $multi_curl->setHeader('X-DEBUG-TEST', 'retry');
+        $multi_curl->setRateLimit('10/1m');
+        $multi_curl->setRetry(2);
+
+        $before_send_call_count = 0;
+        $after_send_call_count = 0;
+        $success_call_count = 0;
+        $error_call_count = 0;
+        $complete_call_count = 0;
+
+        $instance = $multi_curl->addGet(Test::TEST_URL, ['failures' => '5']);
+        $instance->beforeSend(function ($instance) use (&$before_send_call_count) {
+            $before_send_call_count += 1;
+        });
+        $instance->afterSend(function ($instance) use (&$after_send_call_count) {
+            $after_send_call_count += 1;
+        });
+        $instance->success(function ($instance) use (&$success_call_count) {
+            $success_call_count += 1;
+        });
+        $instance->error(function ($instance) use (&$error_call_count) {
+            $error_call_count += 1;
+        });
+        $instance->complete(function ($instance) use (&$complete_call_count) {
+            $complete_call_count += 1;
+        });
+
+        $multi_curl->start();
+
+        $this->assertTrue($instance->error);
+        $this->assertEquals(3, $instance->attempts);
+        $this->assertEquals(2, $instance->retries);
+
+        // Assert each of the 3 attempts consumed rate limit quota.
+        $this->assertEquals(3, \Helper\get_multi_curl_property_value($multi_curl, 'currentRequestCount'));
+
+        // Assert beforeSend and afterSend callbacks were called for each attempt.
+        $this->assertEquals(3, $before_send_call_count);
+        $this->assertEquals(3, $after_send_call_count);
+
+        // Assert success, error, and complete callbacks were called only once.
+        $this->assertEquals(0, $success_call_count);
+        $this->assertEquals(1, $error_call_count);
+        $this->assertEquals(1, $complete_call_count);
+    }
+
+    public function testRetryRateLimitWaitsForNextWindow()
+    {
+        if ($this->skip_slow_tests) {
+            $this->markTestSkipped();
+        }
+
+        // Assert that a retry attempt exceeding the rate limit waits until
+        // the next interval before being sent.
+        //
+        //  A1--| (fail)
+        //  A2--| (fail)
+        //      W---------------|
+        //                      A3--| (success)
+        //  0   1   2   3   4   5   6
+
+        $multi_curl = new MultiCurl();
+        $multi_curl->setOpt(CURLOPT_COOKIEJAR, '/dev/null');
+        $multi_curl->setHeader('X-DEBUG-TEST', 'retry');
+        $multi_curl->setRateLimit('2/5s');
+        $multi_curl->setRetry(2);
+
+        $before_send_times = [];
+
+        $instance = $multi_curl->addGet(Test::getTestUrl('8001'), ['failures' => '2']);
+        $instance->beforeSend(function ($instance) use (&$before_send_times) {
+            $before_send_times[] = microtime(true);
+        });
+
+        $multi_curl->start();
+
+        $this->assertFalse($instance->error);
+        $this->assertEquals(3, $instance->attempts);
+        $this->assertEquals(2, $instance->retries);
+        $this->assertCount(3, $before_send_times);
+
+        // Assert the first two attempts were sent in the first interval.
+        $this->assertLessThanOrEqual(4.5, $before_send_times['0'] - $multi_curl->startTime);
+        $this->assertLessThanOrEqual(4.5, $before_send_times['1'] - $multi_curl->startTime);
+
+        // Assert the third attempt waited for the next interval as the rate
+        // limit of 2 requests per 5 seconds was reached by the first two
+        // attempts.
+        $this->assertGreaterThanOrEqual(5, $before_send_times['2'] - $multi_curl->startTime);
+
+        // Assert the total duration includes the wait for the next interval.
+        $this->assertGreaterThanOrEqual(5, $multi_curl->stopTime - $multi_curl->startTime);
+    }
+
+    public function testRetryRateLimitDoesNotBlockOtherRequests()
+    {
+        if ($this->skip_slow_tests) {
+            $this->markTestSkipped();
+        }
+
+        // Assert that other requests continue being processed while a retry
+        // waits for request quota to become available.
+        //
+        //  A1--|               (fail, retry deferred)
+        //  S1----------------------|  (slow request continues during wait)
+        //      W---------------|
+        //                      A2--| (retry sent in next interval)
+        //  0   1   2   3   4   5   6   7
+
+        $multi_curl = new MultiCurl();
+        $multi_curl->setOpt(CURLOPT_COOKIEJAR, '/dev/null');
+        $multi_curl->setRateLimit('2/5s');
+        $multi_curl->setRetry(1);
+
+        $retry_before_send_times = [];
+        $retry_complete_time = null;
+        $slow_complete_time = null;
+
+        $retry_instance = $multi_curl->addGet(Test::getTestUrl('8001'), [
+            'test' => 'retry',
+            'failures' => '1',
+        ]);
+        $retry_instance->beforeSend(function ($instance) use (&$retry_before_send_times) {
+            $retry_before_send_times[] = microtime(true);
+        });
+        $retry_instance->complete(function ($instance) use (&$retry_complete_time) {
+            $retry_complete_time = microtime(true);
+        });
+
+        $slow_instance = $multi_curl->addGet(Test::getTestUrl('8002'), [
+            'test' => 'timeout',
+            'seconds' => '6',
+        ]);
+        $slow_instance->complete(function ($instance) use (&$slow_complete_time) {
+            $slow_complete_time = microtime(true);
+        });
+
+        $multi_curl->start();
+
+        // Assert the slow request was not interrupted and completed around 6 seconds.
+        $this->assertFalse($slow_instance->error);
+        $this->assertNotNull($slow_complete_time);
+        $this->assertGreaterThanOrEqual(5.8, $slow_complete_time - $multi_curl->startTime);
+        $this->assertLessThanOrEqual(7.5, $slow_complete_time - $multi_curl->startTime);
+
+        // Assert the retry succeeded after waiting for the next interval.
+        $this->assertFalse($retry_instance->error);
+        $this->assertEquals(2, $retry_instance->attempts);
+        $this->assertEquals(1, $retry_instance->retries);
+        $this->assertCount(2, $retry_before_send_times);
+        $this->assertGreaterThanOrEqual(5, $retry_before_send_times['1'] - $multi_curl->startTime);
+
+        // Assert the retry completed while the slow request was still being
+        // processed.
+        $this->assertNotNull($retry_complete_time);
+        $this->assertLessThanOrEqual($slow_complete_time, $retry_complete_time);
+    }
+
+    public function testRetryRateLimitStop()
+    {
+        // Assert that no additional requests are sent and no additional
+        // callbacks are called when stop() is called while a retry is
+        // pending.
+        $multi_curl = new MultiCurl();
+        $multi_curl->setOpt(CURLOPT_COOKIEJAR, '/dev/null');
+        $multi_curl->setHeader('X-DEBUG-TEST', 'retry');
+        $multi_curl->setRateLimit('1/30s');
+        $multi_curl->setRetry(5);
+
+        $before_send_call_count = 0;
+        $after_send_call_count = 0;
+        $success_call_count = 0;
+        $error_call_count = 0;
+        $complete_call_count = 0;
+
+        $instance = $multi_curl->addGet(Test::TEST_URL, ['failures' => '10']);
+        $instance->beforeSend(function ($instance) use (&$before_send_call_count) {
+            $before_send_call_count += 1;
+        });
+        $instance->afterSend(function ($instance) use (&$after_send_call_count, $multi_curl) {
+            $after_send_call_count += 1;
+
+            // Stop while the failed request is pending retry.
+            $multi_curl->stop();
+        });
+        $instance->success(function ($instance) use (&$success_call_count) {
+            $success_call_count += 1;
+        });
+        $instance->error(function ($instance) use (&$error_call_count) {
+            $error_call_count += 1;
+        });
+        $instance->complete(function ($instance) use (&$complete_call_count) {
+            $complete_call_count += 1;
+        });
+
+        $start_time = microtime(true);
+        $multi_curl->start();
+        $elapsed_seconds = microtime(true) - $start_time;
+
+        // Assert the pending retry was not sent after stop() without waiting
+        // for the next rate limit interval.
+        $this->assertLessThanOrEqual(10, $elapsed_seconds);
+        $this->assertEquals(1, $instance->attempts);
+        $this->assertEquals(0, $instance->retries);
+
+        // Assert no additional callbacks were called after stop().
+        $this->assertEquals(1, $before_send_call_count);
+        $this->assertEquals(1, $after_send_call_count);
+        $this->assertEquals(0, $success_call_count);
+        $this->assertEquals(0, $error_call_count);
+        $this->assertEquals(0, $complete_call_count);
+    }
+
+    public function testRetryRateLimitStopClearsPendingRetry()
+    {
+        // Assert that a request already waiting to be retried is not sent
+        // and calls no additional callbacks when stop() is called by another
+        // request.
+        $multi_curl = new MultiCurl();
+        $multi_curl->setOpt(CURLOPT_COOKIEJAR, '/dev/null');
+        $multi_curl->setRateLimit('2/30s');
+        $multi_curl->setRetry(5);
+
+        $retry_before_send_call_count = 0;
+        $retry_after_send_call_count = 0;
+        $retry_success_call_count = 0;
+        $retry_error_call_count = 0;
+        $retry_complete_call_count = 0;
+
+        $retry_instance = $multi_curl->addGet(Test::getTestUrl('8001'), [
+            'test' => 'retry',
+            'failures' => '10',
+        ]);
+        $retry_instance->beforeSend(function ($instance) use (&$retry_before_send_call_count) {
+            $retry_before_send_call_count += 1;
+        });
+        $retry_instance->afterSend(function ($instance) use (&$retry_after_send_call_count) {
+            $retry_after_send_call_count += 1;
+        });
+        $retry_instance->success(function ($instance) use (&$retry_success_call_count) {
+            $retry_success_call_count += 1;
+        });
+        $retry_instance->error(function ($instance) use (&$retry_error_call_count) {
+            $retry_error_call_count += 1;
+        });
+        $retry_instance->complete(function ($instance) use (&$retry_complete_call_count) {
+            $retry_complete_call_count += 1;
+        });
+
+        $other_instance = $multi_curl->addGet(Test::getTestUrl('8002'), [
+            'test' => 'timeout',
+            'seconds' => '1',
+        ]);
+        $other_instance->complete(function ($instance) use ($multi_curl) {
+            // Stop while the other request is waiting to be retried.
+            $multi_curl->stop();
+        });
+
+        $start_time = microtime(true);
+        $multi_curl->start();
+        $elapsed_seconds = microtime(true) - $start_time;
+
+        // Assert the request waiting to be retried was not sent again after
+        // stop() without waiting for the next rate limit interval.
+        $this->assertLessThanOrEqual(10, $elapsed_seconds);
+        $this->assertEquals(1, $retry_instance->attempts);
+        $this->assertEquals(1, $retry_instance->retries);
+
+        // Assert no additional callbacks were called for the request waiting
+        // to be retried after stop().
+        $this->assertEquals(1, $retry_before_send_call_count);
+        $this->assertEquals(1, $retry_after_send_call_count);
+        $this->assertEquals(0, $retry_success_call_count);
+        $this->assertEquals(0, $retry_error_call_count);
+        $this->assertEquals(0, $retry_complete_call_count);
+    }
+
     public function testRelativeUrl()
     {
         $multi_curl = new MultiCurl(Test::TEST_URL . 'path/');

@@ -14,6 +14,7 @@ class MultiCurl extends BaseCurl
 
     private $queuedCurls = [];
     protected \WeakMap $activeCurls;
+    private $retryPendingCurls = [];
     private $isStarted = false;
     private $currentStartTime = null;
     private $currentRequestCount = 0;
@@ -356,6 +357,10 @@ class MultiCurl extends BaseCurl
             $curl->close();
         }
 
+        foreach ($this->retryPendingCurls as $curl) {
+            $curl->close();
+        }
+
         if (is_resource($this->multiCurl) || $this->multiCurl instanceof \CurlMultiHandle) {
             curl_multi_close($this->multiCurl);
         }
@@ -672,6 +677,17 @@ class MultiCurl extends BaseCurl
                 $this->initHandle();
             }
 
+            // Add handles for requests pending retry. Each retry attempt
+            // consumes request quota so that retries may need to wait until
+            // the next rate limit interval before being sent.
+            while (
+                count($this->retryPendingCurls) &&
+                count($this->activeCurls) < $this->concurrency &&
+                (!$this->rateLimitEnabled || $this->hasRequestQuota())
+            ) {
+                $this->initRetryHandle();
+            }
+
             if ($this->rateLimitEnabled && !count($this->activeCurls) && !$this->hasRequestQuota()) {
                 $this->waitUntilRequestQuotaAvailable();
             }
@@ -694,18 +710,44 @@ class MultiCurl extends BaseCurl
                         $curl->curlErrorCode = $info_array['result'];
                         $curl->exec($native_handle);
 
-                        if ($curl->attemptRetry()) {
+                        // Avoid calling the retry decider when stop() was
+                        // called during one of the instance's callbacks.
+                        $attempt_retry = false;
+                        if ($this->isStarted) {
+                            $attempt_retry = $curl->attemptRetry();
+                        }
+
+                        // Avoid sending additional requests and calling
+                        // additional callbacks when stop() was called during
+                        // one of the instance's callbacks or the retry
+                        // decider.
+                        if (!$this->isStarted) {
+                            continue;
+                        }
+
+                        if ($attempt_retry) {
                             // Remove completed handle before adding again in order to retry request.
                             curl_multi_remove_handle($this->multiCurl, $native_handle);
 
-                            $curlm_error_code = curl_multi_add_handle($this->multiCurl, $native_handle);
-                            if ($curlm_error_code !== CURLM_OK) {
-                                throw new \ErrorException(
-                                    'cURL multi add handle error: ' . curl_multi_strerror($curlm_error_code)
-                                );
-                            }
+                            if ($this->rateLimitEnabled) {
+                                // Defer the retry until request quota is
+                                // available so that each attempt consumes
+                                // rate limit quota. The instance is removed
+                                // from active curls allowing other requests
+                                // to continue being processed while the
+                                // retry waits for the next interval.
+                                $this->activeCurls->offsetUnset($native_handle);
+                                $this->retryPendingCurls[$curl->id] = $curl;
+                            } else {
+                                $curlm_error_code = curl_multi_add_handle($this->multiCurl, $native_handle);
+                                if ($curlm_error_code !== CURLM_OK) {
+                                    throw new \ErrorException(
+                                        'cURL multi add handle error: ' . curl_multi_strerror($curlm_error_code)
+                                    );
+                                }
 
-                            $curl->call($curl->beforeSendCallback);
+                                $curl->call($curl->beforeSendCallback);
+                            }
                         } else {
                             $curl->execDone();
 
@@ -721,7 +763,10 @@ class MultiCurl extends BaseCurl
                     }
                 }
             }
-        } while ($active || count($this->activeCurls) || count($this->queuedCurls));
+        } while (
+            $this->isStarted &&
+            ($active || count($this->activeCurls) || count($this->queuedCurls) || count($this->retryPendingCurls))
+        );
 
         $this->isStarted = false;
         $this->stopTime = microtime(true);
@@ -740,6 +785,14 @@ class MultiCurl extends BaseCurl
         // Remove any queued curl requests.
         while (count($this->queuedCurls)) {
             $curl = array_pop($this->queuedCurls);
+            $curl->close();
+        }
+
+        // Remove any curl requests waiting to be retried so that no
+        // additional requests are sent and no additional callbacks are
+        // called after stop.
+        while (count($this->retryPendingCurls)) {
+            $curl = array_pop($this->retryPendingCurls);
             $curl->close();
         }
 
@@ -875,6 +928,34 @@ class MultiCurl extends BaseCurl
             $random_proxy = ArrayUtil::arrayRandom($this->proxies);
             $curl->setProxy($random_proxy);
         }
+
+        $curlm_error_code = curl_multi_add_handle($this->multiCurl, $curl->curl);
+        if ($curlm_error_code !== CURLM_OK) {
+            throw new \ErrorException('cURL multi add handle error: ' . curl_multi_strerror($curlm_error_code));
+        }
+
+        $curl->call($curl->beforeSendCallback);
+    }
+
+    /**
+     * Init Retry Handle
+     *
+     * Add a handle of an instance pending retry that has been waiting for
+     * available request quota. Each retry attempt consumes request quota.
+     *
+     * @throws \ErrorException
+     */
+    private function initRetryHandle()
+    {
+        $curl = array_shift($this->retryPendingCurls);
+        if ($curl === null) {
+            return;
+        }
+
+        // Count the retry attempt against the rate limit and add the
+        // instance back to the list of active curls.
+        $this->currentRequestCount += 1;
+        $this->activeCurls[$curl->curl] = $curl;
 
         $curlm_error_code = curl_multi_add_handle($this->multiCurl, $curl->curl);
         if ($curlm_error_code !== CURLM_OK) {
